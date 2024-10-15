@@ -1,42 +1,40 @@
+use anyhow::Result; // To easily propagate errors
+use futures::{stream::StreamExt, SinkExt};
+use log::info;
+use serde_json::Value;
+use solana_client::client_error::ClientError;
+use solana_client::rpc_client::{RpcClient, RpcClientConfig};
+use solana_client::rpc_config::RpcBlockConfig;
+use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_sdk::instruction::CompiledInstruction;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_sdk::{config, transaction};
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, TransactionDetails, UiConfirmedBlock, UiInnerInstructions, UiTransactionEncoding
+};
+use solana_transaction_status::{
+    EncodedTransactionWithStatusMeta, UiInstruction, UiParsedInstruction,
+};
+use std::os::unix::process;
 use std::result;
 use std::str::FromStr;
 use std::thread::sleep;
 use std::time::Duration;
-
-use futures::{stream::StreamExt, SinkExt};
-use log::info;
-use serde_json::Value;
-use solana_client::rpc_client::{RpcClient, RpcClientConfig};
-use solana_client::rpc_config::RpcBlockConfig;
-use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::config;
-use solana_sdk::instruction::CompiledInstruction;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, TransactionDetails, UiInnerInstructions, UiTransactionEncoding};
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::Retry;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::client_with_config;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_retry::Retry;
-use tokio_retry::strategy::{ExponentialBackoff, jitter};
-use solana_client::client_error::ClientError;
-
-// use solana_transaction_status::UiTransactionEncoding;
-
-// use solana_client::rpc_config::RpcBlockConfig;
-use anyhow::Result; // To easily propagate errors
+// use solana_transaction_status::{UiInstruction, EncodedConfirmedTransaction, UiParsedInstruction};
 
 
 #[tokio::main]
-async fn main() {
-
-    env_logger::init();// Initialize the logger 
-
-    // WebSocket URL for Solana's RPC
+async fn main() -> Result<()> {
+    env_logger::init(); // Initialize the logger
+                        // WebSocket URL for Solana's RPC
     let ws_url = "wss://api.mainnet-beta.solana.com/".to_string(); // Replace with correct WebSocket URL
-
-    // Connect to the WebSocket
-
+                                                                   // Connect to the WebSocket
     let (ws_stream, _) = connect_async(ws_url)
         .await
         .expect("Failed to connect to WebSocket");
@@ -52,12 +50,14 @@ async fn main() {
 
     // Instantiate the Solana RPC client
     let rpc_url = "https://api.mainnet-beta.solana.com"; // Replace with the correct RPC URL
-    
+
     let config: RpcBlockConfig = RpcBlockConfig {
         encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
         transaction_details: Some(TransactionDetails::Full),
         rewards: Some(false),
-        commitment: Some(CommitmentConfig { commitment: CommitmentLevel::Confirmed,}), //  If you ever need a higher level of assurance, you could change it to CommitmentLevel::Finalized, but Confirmed is fine for most real-time use cases.
+        commitment: Some(CommitmentConfig {
+            commitment: CommitmentLevel::Confirmed,
+        }), //  If you ever need a higher level of assurance, you could change it to CommitmentLevel::Finalized, but Confirmed is fine for most real-time use cases.
         max_supported_transaction_version: Some(0),
     };
 
@@ -78,7 +78,10 @@ async fn main() {
 
                             // Fetch and process transactions for the given slot
                             if let Some(slot_num) = slot.as_u64() {
-                                let _ = fetch_block_with_retries(slot_num, &client, config).await;
+                                let fecthed_block =
+                                    fetch_block_with_retries(slot_num, &client, config).await?;
+                                info!("HEYSIGNATURE");
+                                let _ = process_transactions(fecthed_block);
                             }
                         }
                     }
@@ -100,75 +103,111 @@ async fn main() {
             }
         }
     }
-}
-
-
-
-async fn fetch_block_with_retries(slot: u64, client: &RpcClient, config: RpcBlockConfig) -> Result<()> {
-    // Define a retry strategy, with an exponential backoff
-    let retry_strategy = ExponentialBackoff::from_millis(10)
-        .map(jitter) // Jitter adds randomness to prevent retry spikes
-        .take(5);    // Retry up to 5 times
-
-    // Use Retry::spawn to retry the get_block_with_config call
-    let result = Retry::spawn(retry_strategy, || {
-        let client = client; 
-        async move {
-            // Attempt to get the block
-            client
-                .get_block_with_config(slot, config)
-                .map_err(|e| e) // Pass the error without wrapping it in tokio_retry::Error
-        }
-    })
-    .await?; // Await the result of the retries, propagate error if all retries fail
-
-    // Handle the block if the request succeeds
-    // You can process `result` (which is the fetched block) here
-    info!("result{:?}", result);
     Ok(())
 }
 
+async fn fetch_block_with_retries(
+    slot: u64,
+    client: &RpcClient,
+    config: RpcBlockConfig,
+) -> Result<UiConfirmedBlock> {
+    // Define a retry strategy, with an exponential backoff
+    let retry_strategy = ExponentialBackoff::from_millis(10)
+        .map(jitter) // Jitter adds randomness to prevent retry spikes
+        .take(5); // Retry up to 5 times
 
+    // Use Retry::spawn to retry the get_block_with_config call
+    let result = Retry::spawn(retry_strategy, || {
+        let client = client;
+        async move {
+            // Attempt to get the block
+            client.get_block_with_config(slot, config).map_err(|e| e) // Pass the error without wrapping it in tokio_retry::Error
+        }
+    })
+    .await?;
 
+    Ok(result)
+}
 
+fn process_transactions(fetched_block: UiConfirmedBlock) {
+    if let Some(transactions) = fetched_block.transactions {
+        for transaction in transactions {
+            if let Some(meta) = &transaction.meta {
+                println!("Status: {:?}", meta.status); // Check the status of the transaction (Success or Failure)
+                println!("Fee: {:?}", meta.fee);       // Fee for the transaction
 
+                // Access the inner instructions by deserializing OptionSerializer
+                if let Some(inner_instructions) = meta.inner_instructions.clone().into_option() {
+                    for instruction in inner_instructions {
+                        for inst in &instruction.instructions {
+                            if let UiInstruction::Parsed(UiParsedInstruction { program, parsed, .. }) = inst {
+                                println!("Program: {:?}", program); // Output the program involved
+                                println!("Parsed Instruction: {:?}", parsed); // Output parsed details
+                                
+                                // Call the detect_new_pools_or_tokens function
+                                detect_new_pools_or_tokens(parsed, program);
+                            }
+                        }
+                    }
+                }
+            }
 
+            // Now handle the main message (not just inner instructions)
+            if let EncodedTransaction::Json(parsed_message) = &transaction.transaction {
+                let message = &parsed_message.message; // This will be UiParsedMessage
 
+                // Access recent blockhash from UiParsedMessage
+                println!("Recent Blockhash: {:?}", message.recent_blockhash);
 
+                // Access account keys from UiParsedMessage
+                for account in &message.account_keys {
+                    println!("Account Key: {:?}", account.pubkey);
+                }
 
+                // Access instructions from UiParsedMessage
+                for instruction in &message.instructions {
+                    if let UiInstruction::Parsed(UiParsedInstruction { program, parsed, .. }) = instruction {
+                        println!("Main Instruction Program: {:?}", program);
+                        println!("Main Parsed Instruction: {:?}", parsed);
+                    }
+                }
+            } else {
+                println!("Transaction not in JSON-parsed format.");
+            }
+        }
+    }
+}
 
+// Example definition of the missing function
+fn detect_new_pools_or_tokens(parsed: &Value, program: &str) {
+    // Placeholder logic
+    println!("Detecting new pools or tokens from program: {} and parsed: {:?}", program, parsed);
+}
 
-// // Function to fetch and process transactions for a given slot
-// async fn fetch_and_process_transactions(slot: u64, client: &RpcClient, config: RpcBlockConfig) {
-//     // Fetch confirmed block for the given slot
-//     // sleep(Duration::from_secs(10)); // Poll every 10 seconds
-//     // let result = client.get_block_with_encoding(slot, UiTransactionEncoding::JsonParsed);
-//     let result = client.get_block_with_config(slot, config);
+// async fn analyze_transaction(transaction: &UiTransaction) {
+//     if let solana_transaction_status::UiTransaction::Json(parsed) = transaction {
+//         // Serialize the transaction message to JSON
+//         let serialized_message = serde_json::to_string(&parsed.message).unwrap();
 
-//     info!("result: {:?}", result);
+//         // Deserialize the JSON to Value for further inspection
+//         let message: Value = serde_json::from_str(&serialized_message).unwrap();
 
-//     if let Ok(block) = client.get_block_with_encoding(slot, UiTransactionEncoding::JsonParsed) {
-//         info!("Block: {:?}", block);
-//         let transactions = block.transactions;
-//         for transaction in transactions {
-//             if let Some(sig) = transaction.transaction.decode() {
-//                 for signature in sig.signatures {
-//                     info!("SIGNATURE: {:?}", signature);
-//                     // process_transaction(signature, &client).await;
+//         // Extract relevant parts (e.g., instructions, account_keys, etc.)
+//         if let Some(instructions) = message.get("instructions") {
+//             for instruction in instructions.as_array().unwrap() {
+//                 if let Some(parsed_instruction) = instruction.get("parsed") {
+//                     println!("Instruction: {:?}", parsed_instruction);
 //                 }
-//                 // Inspect each transaction and look for InitializeMint (new tokens) or custom pool init
-//                 // process_transaction(transaction.transaction.signatures[0].clone(), &client).await;
+//             }
+//         }
+
+//         if let Some(account_keys) = message.get("account_keys") {
+//             for key in account_keys.as_array().unwrap() {
+//                 println!("Account Key: {:?}", key.get("pubkey").unwrap());
 //             }
 //         }
 //     }
 // }
-
-
-
-
-
-
-
 
 // // Process each transaction to check for pool initialization or token minting
 // async fn process_transaction(signature: Signature, client: &RpcClient) {
